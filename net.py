@@ -1,5 +1,3 @@
-# encoding: utf-8
-
 import numpy as np
 
 import chainer
@@ -20,9 +18,7 @@ def sentence_block_embed(embed, x):
     Apply embed_id for array of ndim 2,
     shape (batchsize, sentence_length),
     instead for array of ndim 1.
-
     """
-
     batch, length = x.shape
     _, units = embed.W.shape
     e = embed(x.reshape((batch * length, )))
@@ -38,9 +34,7 @@ def seq_func(func, x, reconstruct_shape=True):
     Apply a given function for array of ndim 3,
     shape (batchsize, dimension, sentence_length),
     instead for array of ndim 2.
-
     """
-
     batch, units, length = x.shape
     e = F.transpose(x, (0, 2, 1)).reshape(batch * length, units)
     e = func(e)
@@ -53,68 +47,61 @@ def seq_func(func, x, reconstruct_shape=True):
 
 
 class LayerNormalizationSentence(L.LayerNormalization):
-
-    """ Position-wise Linear Layer for Sentence Block
+    """Position-wise Linear Layer for Sentence Block.
 
     Position-wise layer-normalization layer for array of shape
     (batchsize, dimension, sentence_length).
-
     """
 
     def __init__(self, *args, **kwargs):
         super(LayerNormalizationSentence, self).__init__(*args, **kwargs)
 
     def __call__(self, x):
-        y = seq_func(super(LayerNormalizationSentence, self).__call__, x)
+        y = seq_func(super(LayerNormalizationSentence, self).forward, x)
         return y
 
 
 class ConvolutionSentence(L.Convolution2D):
-
-    """ Position-wise Linear Layer for Sentence Block
+    """Position-wise Linear Layer for Sentence Block.
 
     Position-wise linear layer for array of shape
     (batchsize, dimension, sentence_length)
     can be implemented a convolution layer.
-
     """
 
     def __init__(self, in_channels, out_channels,
                  ksize=1, stride=1, pad=0, nobias=False,
                  initialW=None, initial_bias=None):
         super(ConvolutionSentence, self).__init__(
-            in_channels, out_channels,
-            ksize, stride, pad, nobias,
+            in_channels, out_channels, ksize, stride, pad, nobias,
             initialW, initial_bias)
 
-    def __call__(self, x):
+    def forward(self, x):
         """Applies the linear layer.
 
         Args:
-            x (~chainer.Variable): Batch of input vector block. Its shape is
-                (batchsize, in_channels, sentence_length).
+            x (~chainer.Variable, :ref:`ndarray`): Batch of input vector block.
+                Its shape is (batchsize, in_channels, sentence_length).
 
         Returns:
             ~chainer.Variable: Output of the linear layer. Its shape is
                 (batchsize, out_channels, sentence_length).
-
         """
         x = F.expand_dims(x, axis=3)
-        y = super(ConvolutionSentence, self).__call__(x)
+        y = super(ConvolutionSentence, self).forward(x)
         y = F.squeeze(y, axis=3)
         return y
 
 
 class MultiHeadAttention(chainer.Chain):
 
-    """ Multi Head Attention Layer for Sentence Blocks
+    """Multi Head Attention Layer for Sentence Blocks.
 
     For batch computation efficiency, dot product to calculate query-key
     scores is performed all heads together.
-
     """
 
-    def __init__(self, n_units, h=8, dropout=0.1, self_attention=True):
+    def __init__(self, n_units, n_heads=8, dropout=0.1, self_attention=True):
         super(MultiHeadAttention, self).__init__()
         with self.init_scope():
             if self_attention:
@@ -131,14 +118,14 @@ class MultiHeadAttention(chainer.Chain):
             self.finishing_linear_layer = ConvolutionSentence(
                 n_units, n_units, nobias=True,
                 initialW=linear_init)
-        self.h = h
-        self.scale_score = 1. / (n_units // h) ** 0.5
+        self.n_heads = n_heads
+        self.scale_score = 1. / (n_units // n_heads) ** 0.5
         self.dropout = dropout
         self.is_self_attention = self_attention
 
-    def __call__(self, x, z=None, mask=None):
+    def forward(self, x, z=None, mask=None):
         xp = self.xp
-        h = self.h
+        n_heads = self.n_heads
 
         if self.is_self_attention:
             Q, K, V = F.split_axis(self.W_QKV(x), 3, axis=1)
@@ -152,29 +139,27 @@ class MultiHeadAttention(chainer.Chain):
         # Perform Multi-head Attention using pseudo batching
         # all together at once for efficiency
 
-        batch_Q = F.concat(F.split_axis(Q, h, axis=1), axis=0)
-        batch_K = F.concat(F.split_axis(K, h, axis=1), axis=0)
-        batch_V = F.concat(F.split_axis(V, h, axis=1), axis=0)
-        assert(batch_Q.shape == (batch * h, n_units // h, n_querys))
-        assert(batch_K.shape == (batch * h, n_units // h, n_keys))
-        assert(batch_V.shape == (batch * h, n_units // h, n_keys))
+        batch_Q = F.concat(F.split_axis(Q, n_heads, axis=1), axis=0)
+        batch_K = F.concat(F.split_axis(K, n_heads, axis=1), axis=0)
+        batch_V = F.concat(F.split_axis(V, n_heads, axis=1), axis=0)
+        assert batch_Q.shape == (batch * n_heads, n_units // n_heads, n_querys)
+        assert batch_K.shape == (batch * n_heads, n_units // n_heads, n_keys)
+        assert batch_V.shape == (batch * n_heads, n_units // n_heads, n_keys)
 
-        mask = xp.concatenate([mask] * h, axis=0)
-        batch_A = F.batch_matmul(batch_Q, batch_K, transa=True) \
-            * self.scale_score
-        batch_A = F.where(mask, batch_A, xp.full(batch_A.shape, -np.inf, 'f'))
+        mask = xp.concatenate([mask] * n_heads, axis=0)
+        batch_A = F.matmul(batch_Q, batch_K, transa=True) * self.scale_score
+        batch_A = F.where(mask, batch_A, xp.full(batch_A.shape, -xp.inf, 'f'))
         batch_A = F.softmax(batch_A, axis=2)
         batch_A = F.where(
-            xp.isnan(batch_A.data), xp.zeros(batch_A.shape, 'f'), batch_A)
-        assert(batch_A.shape == (batch * h, n_querys, n_keys))
+            xp.isnan(batch_A.array), xp.zeros(batch_A.shape, 'f'), batch_A)
+        assert batch_A.shape == (batch * n_heads, n_querys, n_keys)
 
         # Calculate Weighted Sum
-        batch_A, batch_V = F.broadcast(
-            batch_A[:, None], batch_V[:, :, None])
+        batch_A, batch_V = F.broadcast(batch_A[:, None], batch_V[:, :, None])
         batch_C = F.sum(batch_A * batch_V, axis=3)
-        assert(batch_C.shape == (batch * h, n_units // h, n_querys))
-        C = F.concat(F.split_axis(batch_C, h, axis=0), axis=1)
-        assert(C.shape == (batch, n_units, n_querys))
+        assert batch_C.shape == (batch * n_heads, n_units // n_heads, n_querys)
+        C = F.concat(F.split_axis(batch_C, n_heads, axis=0), axis=1)
+        assert C.shape == (batch, n_units, n_querys)
         C = self.finishing_linear_layer(C)
         return C
 
@@ -184,14 +169,13 @@ class FeedForwardLayer(chainer.Chain):
         super(FeedForwardLayer, self).__init__()
         n_inner_units = n_units * 4
         with self.init_scope():
-            self.W_1 = ConvolutionSentence(n_units, n_inner_units,
-                                           initialW=linear_init)
-            self.W_2 = ConvolutionSentence(n_inner_units, n_units,
-                                           initialW=linear_init)
-            # self.act = F.relu
+            self.W_1 = ConvolutionSentence(
+                n_units, n_inner_units, initialW=linear_init)
+            self.W_2 = ConvolutionSentence(
+                n_inner_units, n_units, initialW=linear_init)
             self.act = F.leaky_relu
 
-    def __call__(self, e):
+    def forward(self, e):
         e = self.W_1(e)
         e = self.act(e)
         e = self.W_2(e)
@@ -208,7 +192,7 @@ class EncoderLayer(chainer.Chain):
             self.ln_2 = LayerNormalizationSentence(n_units, eps=1e-6)
         self.dropout = dropout
 
-    def __call__(self, e, xx_mask):
+    def forward(self, e, xx_mask):
         sub = self.self_attention(e, e, xx_mask)
         e = e + F.dropout(sub, self.dropout)
         e = self.ln_1(e)
@@ -220,19 +204,19 @@ class EncoderLayer(chainer.Chain):
 
 
 class DecoderLayer(chainer.Chain):
-    def __init__(self, n_units, h=8, dropout=0.1):
+    def __init__(self, n_units, n_heads=8, dropout=0.1):
         super(DecoderLayer, self).__init__()
         with self.init_scope():
-            self.self_attention = MultiHeadAttention(n_units, h)
+            self.self_attention = MultiHeadAttention(n_units, n_heads)
             self.source_attention = MultiHeadAttention(
-                n_units, h, self_attention=False)
+                n_units, n_heads, self_attention=False)
             self.feed_forward = FeedForwardLayer(n_units)
             self.ln_1 = LayerNormalizationSentence(n_units, eps=1e-6)
             self.ln_2 = LayerNormalizationSentence(n_units, eps=1e-6)
             self.ln_3 = LayerNormalizationSentence(n_units, eps=1e-6)
         self.dropout = dropout
 
-    def __call__(self, e, s, xy_mask, yy_mask):
+    def forward(self, e, s, xy_mask, yy_mask):
         sub = self.self_attention(e, e, yy_mask)
         e = e + F.dropout(sub, self.dropout)
         e = self.ln_1(e)
@@ -248,34 +232,27 @@ class DecoderLayer(chainer.Chain):
 
 
 class Encoder(chainer.Chain):
-    def __init__(self, n_layers, n_units, h=8, dropout=0.1):
+    def __init__(self, n_layers, n_units, n_heads=8, dropout=0.1):
         super(Encoder, self).__init__()
-        self.layer_names = []
-        for i in range(1, n_layers + 1):
-            name = 'l{}'.format(i)
-            layer = EncoderLayer(n_units, h, dropout)
-            self.add_link(name, layer)
-            self.layer_names.append(name)
 
-    def __call__(self, e, xx_mask):
-        for name in self.layer_names:
-            e = getattr(self, name)(e, xx_mask)
+        self.layers = chainer.Sequential(
+            *[EncoderLayer(n_units, n_heads, dropout) for _ in range(n_layers)]
+        )
+
+    def forward(self, e, xx_mask):
+        e = self.layers(e, xx_mask)
         return e
 
 
 class Decoder(chainer.Chain):
-    def __init__(self, n_layers, n_units, h=8, dropout=0.1):
+    def __init__(self, n_layers, n_units, n_heads=8, dropout=0.1):
         super(Decoder, self).__init__()
-        self.layer_names = []
-        for i in range(1, n_layers + 1):
-            name = 'l{}'.format(i)
-            layer = DecoderLayer(n_units, h, dropout)
-            self.add_link(name, layer)
-            self.layer_names.append(name)
+        self.layers = chainer.Sequential(
+            *[DecoderLayer(n_units, n_heads, dropout) for _ in range(n_layers)]
+        )
 
-    def __call__(self, e, source, xy_mask, yy_mask):
-        for name in self.layer_names:
-            e = getattr(self, name)(e, source, xy_mask, yy_mask)
+    def forward(self, e, source, xy_mask, yy_mask):
+        e = self.layers(e, source, xy_mask, yy_mask)
         return e
 
 
@@ -327,8 +304,7 @@ class Transformer(chainer.Chain):
         position = xp.arange(length, dtype='f')
         num_timescales = channels // 2
         log_timescale_increment = (
-            xp.log(10000. / 1.) /
-            (float(num_timescales) - 1))
+            xp.log(10000. / 1.) / (float(num_timescales) - 1))
         inv_timescales = 1. * xp.exp(
             xp.arange(num_timescales).astype('f') * -log_timescale_increment)
         scaled_time = \
@@ -410,7 +386,7 @@ class Transformer(chainer.Chain):
             loss = 0.9 * loss + 0.1 * label_smoothing
         return loss
 
-    def __call__(self, x_block, y_in_block, y_out_block, get_prediction=False):
+    def forward(self, x_block, y_in_block, y_out_block, get_prediction=False):
         batch, x_length = x_block.shape
         batch, y_length = y_in_block.shape
 
